@@ -1,117 +1,241 @@
 import os
+import datetime
 import base64
-import tempfile
-import urllib.parse
-from datetime import datetime
-import pandas as pd
-from fpdf import FPDF
-
-from taipy.gui import Gui, State, notify
+from taipy.gui import Gui, notify, invoke_callback
 from supabase import create_client, Client
+from fpdf import FPDF
+import pandas as pd
 
-# --- CONFIG & SUPABASE CONNECTION ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "your_supabase_url")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your_supabase_key")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ==========================================
+# 1. DATABASE & CONFIGURATION
+# ==========================================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-anon-key")
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    print(f"Supabase init error: {e}")
 
-# --- GLOBAL STATE INITIALIZATION ---
-role_options = ["On-Ground Team 🏃", "Manager 👔"]
-role = "On-Ground Team 🏃"
-
+# ==========================================
+# 2. STATE VARIABLES
+# ==========================================
+current_view = "On-Ground Team"
 manager_logged_in = False
-pwd_input = ""
-MANAGER_PASSWORD = os.environ.get("MANAGER_PASSWORD", "kaveri_admin")
+manager_password = ""
 
-today_start = f"{datetime.now().strftime('%Y-%m-%d')}T00:00:00"
-
-# Data States initialized securely
-expected_guests_df = pd.DataFrame(columns=["id", "guest_name", "session_type"])
-active_guests_df = pd.DataFrame(columns=["id", "guest_name", "lounge", "lmw_status", "demo_status", "ready_to_meet_gurudev", "met_gurudev"])
-report_guests_df = pd.DataFrame(columns=["guest_name", "session_type", "lounge", "lmw_status", "demo_status", "met_gurudev", "jai_gurudev"])
-
+# Manager State
+new_guest_names = ""
+new_guest_session = "Morning"
 search_incoming = ""
-session_type_options = ["Morning", "Evening"]
-session_type = "Morning"
-guest_names_input = ""
-manager_lounge = "Unassigned"
-manager_photo = "" 
-
-search_active = ""
-lounge_filter_options = ["All", "Unassigned", "L1", "L2", "L3", "BR", "L5"]
-selected_view = "All"
-team_photo = "" 
+incoming_df = pd.DataFrame()
 pdf_path = ""
 
-# CRITICAL FIX: Initialize all selections STRICTLY as empty lists to prevent null.length crashes
-selected_expected_guest = []
-selected_active_guest = []
+# On-Ground State
+lounge_filter = "All"
+search_active = ""
+active_df = pd.DataFrame()
 
-table_lovs = {
-    "lounge": ["Unassigned", "L1", "L2", "L3", "BR", "L5"],
-    "lmw_status": ["Not yet", "Started", "Done"],
-    "demo_status": ["Not yet", "Started", "Done"]
-}
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+def get_today_start():
+    """Returns midnight of the current day in ISO format."""
+    now = datetime.datetime.now()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
-# --- HELPER FUNCTIONS ---
-def has_selection(val):
-    """Safely checks if a table row is currently selected without crashing."""
-    if val is None: return False
-    if isinstance(val, list) and len(val) == 0: return False
-    if isinstance(val, str) and val == "": return False
-    return True
-
-def get_wa_url(active_df, sel_idx):
-    """Dynamically generates the WhatsApp URL based on the selected row."""
-    if not has_selection(sel_idx): return ""
+def fetch_data(state):
+    """Fetches data from Supabase and updates DataFrames based on filters."""
     try:
-        idx = sel_idx[0] if isinstance(sel_idx, list) else int(sel_idx)
-        if idx >= len(active_df): return ""
-        guest = active_df.iloc[idx]
-        msg = f"*{guest['lounge']}*\n{guest['guest_name']}\n📺 LMW: {guest['lmw_status']}\n💻 IP Demo: {guest['demo_status']}\n⏳ Ready: {'✅' if guest['ready_to_meet_gurudev'] else '❌'}\n🤝 Met: {'✅' if guest['met_gurudev'] else '❌'}"
-        return f"https://wa.me/?text={urllib.parse.quote(msg)}"
-    except Exception:
-        return ""
+        today = get_today_start()
+        
+        # Fetch Incoming Guests (Manager View)
+        res_in = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today).execute()
+        df_in = pd.DataFrame(res_in.data)
+        if not df_in.empty:
+            if state.search_incoming:
+                df_in = df_in[df_in['guest_name'].str.contains(state.search_incoming, case=False, na=False)]
+            df_in = df_in[['id', 'guest_name', 'session_type', 'created_at']]
+        state.incoming_df = df_in
 
-def fetch_data(state: State):
-    global today_start
-    res_exp = supabase.table("guests").select("*").eq("is_active", False).eq("has_left_kaveri", False).gte("created_at", today_start).order("created_at").execute()
-    exp_df = pd.DataFrame(res_exp.data) if res_exp.data else pd.DataFrame(columns=["id", "guest_name", "session_type"])
-    if not exp_df.empty and state.search_incoming:
-        exp_df = exp_df[exp_df["guest_name"].str.contains(state.search_incoming, case=False, na=False)]
-    state.expected_guests_df = exp_df
+        # Fetch Active Guests (On-Ground View)
+        res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today).execute()
+        df_act = pd.DataFrame(res_act.data)
+        if not df_act.empty:
+            if state.lounge_filter != "All":
+                df_act = df_act[df_act['lounge'] == state.lounge_filter]
+            if state.search_active:
+                df_act = df_act[df_act['guest_name'].str.contains(state.search_active, case=False, na=False)]
+            
+            # Custom sorting: Room hierarchy then created_at
+            lounge_order = {"Unassigned": 0, "L1": 1, "L2": 2, "L3": 3, "BR": 4, "L5": 5}
+            df_act['lounge_rank'] = df_act['lounge'].map(lounge_order)
+            df_act = df_act.sort_values(by=['lounge_rank', 'created_at'])
+            df_act = df_act[['id', 'guest_name', 'lounge', 'lmw_status', 'demo_status', 'ready_to_meet_gurudev', 'met_gurudev']]
+        state.active_df = df_act
+    except Exception as e:
+        print(f"Data fetch error: {e}")
 
-    res_act = supabase.table("guests").select("*").eq("is_active", True).eq("jai_gurudev", False).gte("created_at", today_start).order("created_at").execute()
-    act_df = pd.DataFrame(res_act.data) if res_act.data else pd.DataFrame(columns=["id", "guest_name", "lounge", "lmw_status", "demo_status", "ready_to_meet_gurudev", "met_gurudev"])
-    
-    if not act_df.empty:
-        if state.search_active:
-            act_df = act_df[act_df["guest_name"].str.contains(state.search_active, case=False, na=False)]
-        if state.selected_view != "All":
-            act_df = act_df[act_df["lounge"] == state.selected_view]
-    state.active_guests_df = act_df
-
-    res_rep = supabase.table("guests").select("*").gte("created_at", today_start).order("created_at").execute()
-    state.report_guests_df = pd.DataFrame(res_rep.data) if res_rep.data else pd.DataFrame(columns=["guest_name", "session_type", "lounge", "lmw_status", "demo_status", "met_gurudev", "jai_gurudev"])
-
-# --- MANAGER CALLBACKS ---
-def check_login(state: State):
-    if state.pwd_input == MANAGER_PASSWORD:
+# ==========================================
+# 4. CALLBACK FUNCTIONS
+# ==========================================
+def login_manager(state):
+    if state.manager_password == "kaveri_admin":
         state.manager_logged_in = True
-        state.pwd_input = ""
+        state.manager_password = ""
         fetch_data(state)
-        notify(state, "success", "Logged in successfully")
+        notify(state, "success", "Logged in successfully!")
     else:
-        notify(state, "error", "Incorrect password")
+        notify(state, "error", "Incorrect Password")
 
-def logout(state: State):
+def logout_manager(state):
     state.manager_logged_in = False
+    notify(state, "info", "Logged out.")
 
-def add_expected_guests(state: State):
-    if not state.guest_names_input.strip():
-        notify(state, "error", "Please enter at least one guest name.")
+def add_guests(state):
+    names = [name.strip() for name in state.new_guest_names.split("\n") if name.strip()]
+    if not names:
+        notify(state, "warning", "No names provided.")
         return
-    names_list = [n.strip() for n in state.guest_names_input.split('\n') if n.strip()]
-    insert_data = [{"guest_name": name, "session_type": state.session_type} for name in names_list]
-    supabase.table("guests").insert(insert_data).execute()
-    state.guest
+    
+    payload = []
+    for name in names:
+        payload.append({
+            "guest_name": name,
+            "session_type": state.new_guest_session,
+            "is_active": False,
+            "has_left_kaveri": False,
+            "jai_gurudev": False,
+            "lounge": "Unassigned",
+            "lmw_status": "Not yet",
+            "demo_status": "Not yet",
+            "ready_to_meet_gurudev": False,
+            "met_gurudev": False
+        })
+    
+    try:
+        supabase.table("guests").insert(payload).execute()
+        state.new_guest_names = ""
+        fetch_data(state)
+        notify(state, "success", f"Added {len(names)} guests!")
+    except Exception as e:
+        notify(state, "error", f"Error adding guests: {e}")
+
+def checkin_guest(state, var_name, action, payload):
+    """Triggered by the action button on the incoming guests table"""
+    row_idx = payload["index"]
+    guest_id = state.incoming_df.iloc[row_idx]["id"]
+    
+    try:
+        supabase.table("guests").update({"is_active": True}).eq("id", guest_id).execute()
+        fetch_data(state)
+        notify(state, "success", "Guest Checked In!")
+    except Exception as e:
+        notify(state, "error", "Update failed.")
+
+def update_active_guest(state, var_name, payload):
+    """Triggered when a cell is edited in the active guests table (On-Ground view)"""
+    row_idx = payload["index"]
+    col_name = payload["col"]
+    new_value = payload["value"]
+    guest_id = state.active_df.iloc[row_idx]["id"]
+
+    try:
+        supabase.table("guests").update({col_name: new_value}).eq("id", guest_id).execute()
+        fetch_data(state)
+        notify(state, "success", "Status updated!")
+    except Exception as e:
+        notify(state, "error", "Failed to update status.")
+
+def mark_complete(state, var_name, action, payload):
+    """Action button to mark a guest's visit as complete"""
+    row_idx = payload["index"]
+    guest_id = state.active_df.iloc[row_idx]["id"]
+    
+    try:
+        supabase.table("guests").update({"jai_gurudev": True}).eq("id", guest_id).execute()
+        fetch_data(state)
+        notify(state, "success", "Visit Completed!")
+    except Exception as e:
+        notify(state, "error", "Update failed.")
+
+def generate_pdf(state):
+    """Generates an end-of-session PDF report."""
+    today = get_today_start()
+    res = supabase.table("guests").select("*").gte("created_at", today).execute()
+    data = res.data
+    
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(200, 10, txt=f"Kaveri Guest Report - {datetime.date.today()}", ln=True, align="C")
+    
+    pdf.set_font("Arial", size=12)
+    for guest in data:
+        name = guest.get('guest_name', 'Unknown').replace("'", "'").replace('"', '"')
+        status = "Complete" if guest.get('jai_gurudev') else "In Progress"
+        
+        pdf.cell(200, 10, txt=f"Name: {name} | Session: {guest.get('session_type')} | Room: {guest.get('lounge')}", ln=True)
+        pdf.cell(200, 10, txt=f"LMW: {guest.get('lmw_status')} | Demo: {guest.get('demo_status')} | Status: {status}", ln=True)
+        pdf.cell(200, 5, txt="-"*50, ln=True)
+
+    filename = f"Kaveri_Report_{datetime.date.today().strftime('%Y%m%d')}.pdf"
+    pdf.output(filename)
+    state.pdf_path = filename
+    notify(state, "success", "Report generated! Ready to download.")
+
+def on_init(state):
+    fetch_data(state)
+
+# ==========================================
+# 5. UI LAYOUT (Taipy Markdown)
+# ==========================================
+page_md = """
+# 🏛️ Kaveri GM
+
+<|{current_view}|toggle|lov=On-Ground Team;Manager|>
+
+<|part|render={current_view == 'Manager'}|
+    <|part|render={not manager_logged_in}|
+        ## Manager Login
+        <|{manager_password}|input|password=True|label=Enter Password|>
+        <|Login|button|on_action=login_manager|>
+    |>
+
+    <|part|render={manager_logged_in}|
+        <|Logout|button|on_action=logout_manager|>
+
+        ### ⏳ Incoming Guests
+        <|{search_incoming}|input|label=Search Incoming...|on_change=fetch_data|>
+        
+        <|{incoming_df}|table|on_action=checkin_guest|action_columns={{"checkin": "Check-In ➡️"}}|>
+
+        <hr/>
+
+        ### ➕ Add Expected Guests
+        <|{new_guest_session}|selector|lov=Morning;Evening|>
+        <|{new_guest_names}|input|multiline=True|label=Paste Names (one per line)|>
+        <|Add Guests|button|on_action=add_guests|>
+
+        <hr/>
+
+        ### 📊 End of Session Report
+        <|Generate PDF|button|on_action=generate_pdf|>
+        <|{pdf_path}|file_download|label=Download Report|render={pdf_path != ""}|>
+    |>
+|>
+
+<|part|render={current_view == 'On-Ground Team'}|
+    ### 🏃 On-Ground Dashboard
+    
+    <|Refresh Data|button|on_action=fetch_data|>
+    <|{lounge_filter}|selector|lov=All;Unassigned;L1;L2;L3;BR;L5|on_change=fetch_data|>
+    <|{search_active}|input|label=Search Active...|on_change=fetch_data|>
+
+    *Tip: Click directly on Lounge, LMW, or Demo cells to update them instantly.*
+    <|{active_df}|table|editable=True|on_edit=update_active_guest|on_action=mark_complete|action_columns={{"complete": "✅ Complete Visit"}}|>
+|>
+"""
+
+if __name__ == "__main__":
+    Gui(page=page_md).run(title="Kaveri GM", dark_mode=False, port=5000)
     
