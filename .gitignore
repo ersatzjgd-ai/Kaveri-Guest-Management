@@ -1,0 +1,7 @@
+__pycache__/
+.taipy/
+.env
+*.pdf
+*.jpg
+*.png
+.DS_Store
