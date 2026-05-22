@@ -2,3 +2,4 @@ taipy
 supabase
 pandas
 fpdf
+python-dotenv
